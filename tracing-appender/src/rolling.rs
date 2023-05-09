@@ -679,7 +679,7 @@ impl Inner {
     }
 
     // This function is called after each refresh (rotating to a new file). Thus, it only zips the latest log file
-    // #[cfg(feature = "zipping")]
+    #[cfg(feature = "zipping")]
     fn zip_log(&self) -> io::Result<()> {
         // Read the log directory to find the log files
         let mut files = self
