@@ -679,7 +679,7 @@ impl Inner {
     }
 
     // This function is called after each refresh (rotating to a new file). Thus, it only zips the latest log file
-    #[cfg(feature = "zipping")]
+    // #[cfg(feature = "zipping")]
     fn zip_log(&self) -> io::Result<()> {
         // Read the log directory to find the log files
         let mut files = self
@@ -696,8 +696,16 @@ impl Inner {
         let mut input_file = File::open(&input_file_path)?;
         input_file.read_to_end(&mut file_contents)?;
 
-        // Replace the file extension with .zip
-        let output_file_path = input_file_path.with_extension("zip");
+        // Add `.zip` extension to the filename
+        let input_filename = input_file_path
+            .file_name()
+            .expect("Filename should be present")
+            .to_str()
+            .expect("Filename should be valid UTF-8");
+
+        let output_filename = format!("{}.zip", input_filename);
+
+        let output_file_path = input_file_path.with_file_name(output_filename);
 
         // Create a new ZIP archive and write the input file's content to it
         let output_file = File::create(&output_file_path)?;
