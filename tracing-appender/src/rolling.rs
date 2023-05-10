@@ -37,9 +37,7 @@ use std::{
 use time::{format_description, Date, Duration, OffsetDateTime, Time};
 
 #[cfg(feature = "zipping")]
-use io::Read;
-#[cfg(feature = "zipping")]
-use lz4::{Decoder, EncoderBuilder};
+use lz4::EncoderBuilder;
 
 mod builder;
 pub use builder::{Builder, InitError};
@@ -692,11 +690,9 @@ impl Inner {
         let (file, _) = files.last().unwrap();
         // Get input file path and read its content
         let input_file_path = file.path();
-        let mut file_contents = Vec::new();
         let mut input_file = File::open(&input_file_path)?;
-        input_file.read_to_end(&mut file_contents)?;
 
-        // Add `.zip` extension to the filename
+        // Add `.lz4` extension to the filename
         let input_filename = input_file_path
             .file_name()
             .expect("Filename should be present")
@@ -708,7 +704,7 @@ impl Inner {
         let output_file_path = input_file_path.with_file_name(output_filename);
 
         // Create a new ZIP archive and write the input file's content to it
-        let output_file = File::create(&output_file_path)?;
+        let output_file = File::create(output_file_path)?;
         let mut encoder = EncoderBuilder::new().level(4).build(output_file)?;
 
         io::copy(&mut input_file, &mut encoder)?;
@@ -1204,5 +1200,185 @@ mod test {
                 x => panic!("unexpected date {}", x),
             }
         }
+    }
+
+    #[cfg(feature = "zipping")]
+    #[test]
+    fn test_zipping() {
+        use std::io::Read;
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::prelude::*;
+
+        let format = format_description::parse(
+            "[year]-[month]-[day] [hour]:[minute]:[second] [offset_hour \
+     sign:mandatory]:[offset_minute]:[offset_second]",
+        )
+        .unwrap();
+
+        let now = OffsetDateTime::parse("2023-05-01 10:01:00 +00:00:00", &format).unwrap();
+        let directory = tempfile::tempdir().expect("failed to create tempdir");
+        let (state, writer) = Inner::new(
+            now,
+            Rotation::HOURLY,
+            directory.path(),
+            Some("test_zip_log".to_string()),
+            None,
+            None,
+            true,
+        )
+        .unwrap();
+
+        let clock = Arc::new(Mutex::new(now));
+        let now = {
+            let clock = clock.clone();
+            Box::new(move || *clock.lock().unwrap())
+        };
+        let appender = RollingFileAppender { state, writer, now };
+        let default = tracing_subscriber::fmt()
+            .without_time()
+            .with_level(false)
+            .with_target(false)
+            .with_max_level(tracing_subscriber::filter::LevelFilter::TRACE)
+            .with_writer(appender)
+            .finish()
+            .set_default();
+
+        tracing::info!("file 1");
+
+        // advance time by one hour
+        (*clock.lock().unwrap()) += Duration::hours(1);
+
+        // depending on the filesystem, the creation timestamp's resolution may
+        // be as coarse as one second, so we need to wait a bit here to ensure
+        // that the next file actually is newer than the old one.
+        std::thread::sleep(std::time::Duration::from_secs(1));
+
+        tracing::info!("file 2");
+
+        drop(default);
+
+        let dir_contents = fs::read_dir(directory.path()).expect("Failed to read directory");
+        println!("dir={:?}", dir_contents);
+
+        let mut found_zip = false;
+        let mut found_original = false;
+
+        for entry in dir_contents {
+            let entry = entry.expect("Expected dir entry");
+            let path = entry.path();
+
+            println!("entry={:?}", entry);
+
+            if path.extension().unwrap() == "lz4" {
+                found_zip = true;
+                let zip_file = fs::File::open(&path).expect("Failed to open zip file");
+                let mut decoder =
+                    lz4::Decoder::new(zip_file).expect("Failed to create lz4 decoder");
+                let mut contents = String::new();
+                decoder
+                    .read_to_string(&mut contents)
+                    .expect("Failed to read the file content");
+
+                assert_eq!(
+                    "file 1\n", contents,
+                    "Unexpected content in the lz4 compressed log file"
+                );
+            } else {
+                let filename = path.file_name().unwrap().to_str().unwrap();
+                if filename.starts_with("test_zip_log") && filename.ends_with("2023-05-01-10") {
+                    found_original = true;
+                }
+            }
+        }
+
+        assert!(
+            found_zip,
+            "Expected to find a zip file in the log directory"
+        );
+        assert!(!found_original, "Expected the first log file to be removed");
+    }
+
+    #[cfg(feature = "zipping")]
+    #[test]
+    fn test_integration_prune_and_zip() {
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::prelude::*;
+
+        let format = format_description::parse(
+            "[year]-[month]-[day] [hour]:[minute]:[second] [offset_hour \
+     sign:mandatory]:[offset_minute]:[offset_second]",
+        )
+        .unwrap();
+
+        let now = OffsetDateTime::parse("2023-05-01 10:01:00 +00:00:00", &format).unwrap();
+        let directory = tempfile::tempdir().expect("failed to create tempdir");
+        let (state, writer) = Inner::new(
+            now,
+            Rotation::HOURLY,
+            directory.path(),
+            Some("test_integration_prune_and_zip".to_string()),
+            None,
+            Some(2),
+            true,
+        )
+        .unwrap();
+
+        let clock = Arc::new(Mutex::new(now));
+        let now = {
+            let clock = clock.clone();
+            Box::new(move || *clock.lock().unwrap())
+        };
+        let appender = RollingFileAppender { state, writer, now };
+        let default = tracing_subscriber::fmt()
+            .without_time()
+            .with_level(false)
+            .with_target(false)
+            .with_max_level(tracing_subscriber::filter::LevelFilter::TRACE)
+            .with_writer(appender)
+            .finish()
+            .set_default();
+
+        for i in 0..5 {
+            tracing::info!("file {}", i);
+
+            // advance time by one hour
+            (*clock.lock().unwrap()) += Duration::hours(1);
+
+            // depending on the filesystem, the creation timestamp's resolution may
+            // be as coarse as one second, so we need to wait a bit here to ensure
+            // that the next file actually is newer than the old one.
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+
+        drop(default);
+
+        let dir_contents = fs::read_dir(directory.path()).expect("Failed to read directory");
+        println!("dir={:?}", dir_contents);
+
+        let mut zip_count = 0;
+        let mut non_zip_count = 0;
+
+        for entry in dir_contents {
+            let entry = entry.expect("Expected dir entry");
+            let path = entry.path();
+
+            println!("entry={:?}", entry);
+
+            if path.extension().unwrap() == "lz4" {
+                zip_count += 1;
+            } else {
+                non_zip_count += 1;
+            }
+        }
+
+        assert_eq!(
+            zip_count, 1,
+            "Expected to find exactly 1 zip file in the log directory"
+        );
+
+        assert_eq!(
+            non_zip_count, 1,
+            "Expected to find exactly 1 non-zip file in the log directory"
+        );
     }
 }
