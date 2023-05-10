@@ -39,7 +39,7 @@ use time::{format_description, Date, Duration, OffsetDateTime, Time};
 #[cfg(feature = "zipping")]
 use io::Read;
 #[cfg(feature = "zipping")]
-use zip::{write::FileOptions, CompressionMethod, ZipWriter};
+use lz4::{Decoder, EncoderBuilder};
 
 mod builder;
 pub use builder::{Builder, InitError};
@@ -703,30 +703,21 @@ impl Inner {
             .to_str()
             .expect("Filename should be valid UTF-8");
 
-        let output_filename = format!("{}.zip", input_filename);
+        let output_filename = format!("{}.lz4", input_filename);
 
         let output_file_path = input_file_path.with_file_name(output_filename);
 
         // Create a new ZIP archive and write the input file's content to it
         let output_file = File::create(&output_file_path)?;
-        let mut zip_writer = ZipWriter::new(output_file);
-        let file_options = FileOptions::default()
-            .compression_method(CompressionMethod::Deflated)
-            .unix_permissions(0o755);
+        let mut encoder = EncoderBuilder::new().level(4).build(output_file)?;
 
-        // Add the input file to the ZIP archive
-        let input_file_name = input_file_path.file_name().unwrap();
-        zip_writer.start_file(input_file_name.to_string_lossy(), file_options)?;
-        zip_writer.write_all(&file_contents)?;
+        io::copy(&mut input_file, &mut encoder)?;
 
-        // Finish writing the ZIP archive
-        zip_writer.finish()?;
+        let (_output, result) = encoder.finish();
 
-        println!(
-            "Successfully compressed {:?} to {:?}",
-            input_file_path, output_file_path
-        );
-        std::fs::remove_file(&input_file_path)?;
+        result?;
+
+        fs::remove_file(input_file_path)?;
 
         Ok(())
     }
