@@ -1211,10 +1211,7 @@ mod test {
         let directory = tempfile::tempdir().expect("failed to create tempdir");
 
         // write a compression function
-        fn lz4_compress(
-            input: &mut dyn std::io::Read,
-            output: &mut dyn Write,
-        ) -> std::io::Result<()> {
+        fn lz4_compress(input: &mut dyn Read, output: &mut dyn Write) -> std::io::Result<()> {
             let mut encoder = lz4::EncoderBuilder::new().build(output)?;
             io::copy(input, &mut encoder)?;
             let (_output, result) = encoder.finish();
@@ -1305,6 +1302,7 @@ mod test {
 
     #[test]
     fn test_integration_prune_and_zip() {
+        use std::io::Read;
         use std::sync::{Arc, Mutex};
         use tracing_subscriber::prelude::*;
 
@@ -1315,10 +1313,7 @@ mod test {
         .unwrap();
 
         // write a compression function
-        fn lz4_compress(
-            input: &mut dyn std::io::Read,
-            output: &mut dyn Write,
-        ) -> std::io::Result<()> {
+        fn lz4_compress(input: &mut dyn Read, output: &mut dyn Write) -> std::io::Result<()> {
             let mut encoder = lz4::EncoderBuilder::new().build(output)?;
             io::copy(input, &mut encoder)?;
             let (_output, result) = encoder.finish();
