@@ -624,7 +624,7 @@ impl Inner {
                 }
 
                 match (&self.zipping, &self.log_filename_suffix) {
-                    (true, _) if !include_zip_files && filename.ends_with("zip") => {
+                    (true, _) if !include_zip_files && filename.ends_with("lz4") => {
                         return None;
                     }
                     (false, Some(suffix)) if !filename.ends_with(suffix) => {
