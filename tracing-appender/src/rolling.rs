@@ -27,6 +27,7 @@
 //! # }
 //! ```
 use crate::sync::{RwLock, RwLockReadGuard};
+use crate::ZippingFn;
 use std::{
     fmt::{self, Debug},
     fs::{self, File, OpenOptions},
@@ -35,9 +36,6 @@ use std::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 use time::{format_description, Date, Duration, OffsetDateTime, Time};
-
-#[cfg(feature = "zipping")]
-use lz4::EncoderBuilder;
 
 mod builder;
 pub use builder::{Builder, InitError};
@@ -111,7 +109,7 @@ struct Inner {
     rotation: Rotation,
     next_date: AtomicUsize,
     max_files: Option<usize>,
-    zipping: bool,
+    zipping: Option<(String, ZippingFn)>,
 }
 
 // === impl RollingFileAppender ===
@@ -207,7 +205,7 @@ impl RollingFileAppender {
             prefix.clone(),
             suffix.clone(),
             *max_files,
-            *zipping,
+            zipping.clone(),
         )?;
         Ok(Self {
             state,
@@ -533,7 +531,7 @@ impl Inner {
         log_filename_prefix: Option<String>,
         log_filename_suffix: Option<String>,
         max_files: Option<usize>,
-        zip: bool,
+        zip: Option<(String, ZippingFn)>,
     ) -> Result<(Self, RwLock<File>), builder::InitError> {
         let log_directory = directory.as_ref().to_path_buf();
         let date_format = rotation.date_format();
@@ -624,10 +622,12 @@ impl Inner {
                 }
 
                 match (&self.zipping, &self.log_filename_suffix) {
-                    (true, _) if !include_zip_files && filename.ends_with("lz4") => {
+                    (Some((extension, _)), _)
+                        if !include_zip_files && filename.ends_with(extension) =>
+                    {
                         return None;
                     }
-                    (false, Some(suffix)) if !filename.ends_with(suffix) => {
+                    (None, Some(suffix)) if !filename.ends_with(suffix) => {
                         return None;
                     }
                     _ => (),
@@ -657,6 +657,7 @@ impl Inner {
                 return;
             }
         };
+
         if files.len() < max_files {
             return;
         }
@@ -677,7 +678,6 @@ impl Inner {
     }
 
     // This function is called after each refresh (rotating to a new file). Thus, it only zips the latest log file
-    #[cfg(feature = "zipping")]
     fn zip_log(&self) -> io::Result<()> {
         // Read the log directory to find the log files
         let mut files = self
@@ -688,30 +688,24 @@ impl Inner {
         files.sort_by_key(|(_, created_at)| *created_at);
 
         let (file, _) = files.last().unwrap();
-        // Get input file path and read its content
+        // Get input file path
         let input_file_path = file.path();
-        let mut input_file = File::open(&input_file_path)?;
 
-        // Add `.lz4` extension to the filename
         let input_filename = input_file_path
             .file_name()
             .expect("Filename should be present")
             .to_str()
             .expect("Filename should be valid UTF-8");
 
-        let output_filename = format!("{}.lz4", input_filename);
+        let (extension, zipping_fn) = self.zipping.as_ref().unwrap();
+
+        let output_filename = format!("{}.{}", input_filename, extension);
 
         let output_file_path = input_file_path.with_file_name(output_filename);
+        let mut output_file = File::create(output_file_path)?;
 
-        // Create a new ZIP archive and write the input file's content to it
-        let output_file = File::create(output_file_path)?;
-        let mut encoder = EncoderBuilder::new().level(4).build(output_file)?;
-
-        io::copy(&mut input_file, &mut encoder)?;
-
-        let (_output, result) = encoder.finish();
-
-        result?;
+        let mut input_file = File::open(&input_file_path)?;
+        zipping_fn.execute(&mut input_file, &mut output_file)?;
 
         fs::remove_file(input_file_path)?;
 
@@ -726,8 +720,7 @@ impl Inner {
         }
 
         // don't know how long this might take, should we start this in a thread?
-        #[cfg(feature = "zipping")]
-        if self.zipping {
+        if self.zipping.is_some() {
             if let Err(err) = self.zip_log() {
                 eprintln!("Couldn't successfully zip the latest log file: {}", err);
             }
@@ -921,7 +914,7 @@ mod test {
                 prefix.map(ToString::to_string),
                 suffix.map(ToString::to_string),
                 None,
-                false,
+                None,
             )
             .unwrap();
             let path = inner.join_date(&now);
@@ -1034,7 +1027,7 @@ mod test {
             Some("test_make_writer".to_string()),
             None,
             None,
-            false,
+            None,
         )
         .unwrap();
 
@@ -1117,7 +1110,7 @@ mod test {
             Some("test_max_log_files".to_string()),
             None,
             Some(2),
-            false,
+            None,
         )
         .unwrap();
 
@@ -1202,7 +1195,6 @@ mod test {
         }
     }
 
-    #[cfg(feature = "zipping")]
     #[test]
     fn test_zipping() {
         use std::io::Read;
@@ -1217,6 +1209,19 @@ mod test {
 
         let now = OffsetDateTime::parse("2023-05-01 10:01:00 +00:00:00", &format).unwrap();
         let directory = tempfile::tempdir().expect("failed to create tempdir");
+
+        // write a compression function
+        fn lz4_compress(
+            input: &mut dyn std::io::Read,
+            output: &mut dyn Write,
+        ) -> std::io::Result<()> {
+            let mut encoder = lz4::EncoderBuilder::new().build(output)?;
+            io::copy(input, &mut encoder)?;
+            let (_output, result) = encoder.finish();
+            result
+        }
+        let compress_fn = ZippingFn(Arc::new(Box::new(lz4_compress)));
+
         let (state, writer) = Inner::new(
             now,
             Rotation::HOURLY,
@@ -1224,7 +1229,7 @@ mod test {
             Some("test_zip_log".to_string()),
             None,
             None,
-            true,
+            Some(("lz4".to_string(), compress_fn)),
         )
         .unwrap();
 
@@ -1298,7 +1303,6 @@ mod test {
         assert!(!found_original, "Expected the first log file to be removed");
     }
 
-    #[cfg(feature = "zipping")]
     #[test]
     fn test_integration_prune_and_zip() {
         use std::sync::{Arc, Mutex};
@@ -1310,16 +1314,28 @@ mod test {
         )
         .unwrap();
 
+        // write a compression function
+        fn lz4_compress(
+            input: &mut dyn std::io::Read,
+            output: &mut dyn Write,
+        ) -> std::io::Result<()> {
+            let mut encoder = lz4::EncoderBuilder::new().build(output)?;
+            io::copy(input, &mut encoder)?;
+            let (_output, result) = encoder.finish();
+            result
+        }
+        let compress_fn = ZippingFn(Arc::new(Box::new(lz4_compress)));
+
         let now = OffsetDateTime::parse("2023-05-01 10:01:00 +00:00:00", &format).unwrap();
         let directory = tempfile::tempdir().expect("failed to create tempdir");
         let (state, writer) = Inner::new(
             now,
             Rotation::HOURLY,
             directory.path(),
-            Some("test_integration_prune_and_zip".to_string()),
+            Some("test_zip_log".to_string()),
             None,
             Some(2),
-            true,
+            Some(("lz4".to_string(), compress_fn)),
         )
         .unwrap();
 

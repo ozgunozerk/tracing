@@ -1,3 +1,5 @@
+use crate::ZippingFn;
+
 use super::{RollingFileAppender, Rotation};
 use std::{io, path::Path};
 use thiserror::Error;
@@ -11,7 +13,7 @@ pub struct Builder {
     pub(super) prefix: Option<String>,
     pub(super) suffix: Option<String>,
     pub(super) max_files: Option<usize>,
-    pub(super) zipping: bool,
+    pub(super) zipping: Option<(String, ZippingFn)>,
 }
 
 /// Errors returned by [`Builder::build`].
@@ -55,7 +57,7 @@ impl Builder {
             prefix: None,
             suffix: None,
             max_files: None,
-            zipping: false,
+            zipping: None,
         }
     }
 
@@ -259,11 +261,20 @@ impl Builder {
     /// # Examples
     ///
     /// ```
-    /// use tracing_appender::rolling::RollingFileAppender;
+    /// use tracing_appender::rolling::{RollingFileAppender, ZippingFn};
+    /// use lz4::EncoderBuilder;
+    /// use std::io;
     ///
     /// # fn docs() {
+    /// let lz4_fn = ZippingFn(Box::new(|input: &mut dyn io::Read, output: &mut dyn io::Write| {
+    ///     let mut encoder = EncoderBuilder::new().level(4).build(output)?;
+    ///     io::copy(input, &mut encoder)?;
+    ///     let (_output, result) = encoder.finish();
+    ///     result
+    /// }));
+    ///
     /// let appender = RollingFileAppender::builder()
-    ///     .zipping(true) // enable zipping
+    ///     .zipping("lz4", lz4_fn) // enable zipping
     ///     // ...
     ///     .build("/var/log")
     ///     .expect("failed to initialize rolling file appender");
@@ -271,9 +282,9 @@ impl Builder {
     /// # }
     /// ```
     #[must_use]
-    pub fn zipping(self, flag: bool) -> Self {
+    pub fn zipping(self, extension: String, zipping_function: ZippingFn) -> Self {
         Self {
-            zipping: flag,
+            zipping: Some((extension, zipping_function)),
             ..self
         }
     }

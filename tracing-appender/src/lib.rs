@@ -149,7 +149,10 @@
 )]
 use crate::non_blocking::{NonBlocking, WorkerGuard};
 
-use std::io::Write;
+use std::{
+    io::{Read, Write},
+    sync::Arc,
+};
 
 pub mod non_blocking;
 
@@ -184,4 +187,23 @@ pub fn non_blocking<T: Write + Send + Sync + 'static>(writer: T) -> (NonBlocking
 pub(crate) enum Msg {
     Line(Vec<u8>),
     Shutdown,
+}
+
+type ZipFnType = dyn Fn(&mut dyn Read, &mut dyn Write) -> std::io::Result<()> + Send + Sync;
+
+/// wrapper for the custom zipping function supplied by the user with a custom debug implementation
+#[derive(Clone)]
+pub struct ZippingFn(Arc<Box<ZipFnType>>);
+
+impl std::fmt::Debug for ZippingFn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "zipping function")
+    }
+}
+
+impl ZippingFn {
+    /// executes the function
+    pub fn execute(&self, reader: &mut dyn Read, writer: &mut dyn Write) -> std::io::Result<()> {
+        (self.0)(reader, writer)
+    }
 }
