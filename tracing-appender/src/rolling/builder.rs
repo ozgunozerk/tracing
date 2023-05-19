@@ -264,7 +264,7 @@ impl Builder {
     /// # Examples
     ///
     /// ```
-    /// use tracing_appender::rolling::{RollingFileAppender, ZippingFn};
+    /// use tracing_appender::rolling::{RollingFileAppender};
     /// use snap::write::FrameEncoder;
     ///
     /// let appender = RollingFileAppender::builder()

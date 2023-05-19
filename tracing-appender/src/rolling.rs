@@ -196,7 +196,6 @@ impl RollingFileAppender {
     ///     .filename_prefix("myapp") // log file names will be prefixed with `myapp.`
     ///     .filename_suffix("log") // log file names will be suffixed with `.log`
     ///     .max_log_files(5) // keep maximum 5 log files at a time
-    ///     .zipping(true) // zip the finalized log files
     ///     .build("/var/log") // try to build an appender that stores log files in `/var/log`
     ///     .expect("initializing rolling file appender failed");
     /// # drop(file_appender);
@@ -1208,25 +1207,36 @@ mod test {
             .finish()
             .set_default();
 
-        // Log some messages
-        tracing::info!("This is a test log message 1.");
-        (*clock.lock().unwrap()) += Duration::hours(1);
-        std::thread::sleep(std::time::Duration::from_secs(1));
-        tracing::info!("This is a test log message 2.");
+        // Create original messages list in order
+        let original_messages = vec![
+            "This is a test log message 1.",
+            "This is a test log message 2.",
+        ];
+
+        for &message in original_messages.iter() {
+            tracing::info!("{}", message);
+            (*clock.lock().unwrap()) += Duration::hours(1);
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
 
         drop(default);
 
-        // Iterate over the directory and assert on each file's contents
-        let dir_entries = fs::read_dir(directory.path()).expect("Failed to read directory");
+        // Get directory entries sorted by file creation time
+        let mut entries: Vec<_> = fs::read_dir(directory.path())
+            .expect("Failed to read directory")
+            .collect::<Result<_, _>>()
+            .expect("Failed to collect entries");
 
-        for entry in dir_entries {
-            let entry = entry.expect("Failed to read entry");
+        entries.sort_unstable_by_key(|e| {
+            e.metadata()
+                .expect("Failed to get metadata")
+                .created()
+                .expect("Failed to get creation time")
+        });
+
+        // Iterate over the directory and assert on each file's contents
+        for (entry, original_text) in entries.into_iter().zip(original_messages) {
             let file_path = entry.path();
-            let original_text = if file_path.to_str().unwrap().contains("2020-02-01-10") {
-                "This is a test log message 1."
-            } else {
-                "This is a test log message 2."
-            };
 
             // Open the file and read it into a buffer
             let mut file = fs::File::open(&file_path).expect("Failed to open file");
@@ -1241,17 +1251,7 @@ mod test {
                 .expect("Failed to decode Snappy content");
 
             // Assert on the contents
-            if file_path
-                .extension()
-                .expect("No extension")
-                .to_str()
-                .expect("Not UTF8")
-                == "1"
-            {
-                assert_eq!(original_text, decoded.trim());
-            } else {
-                assert_eq!(original_text, decoded.trim());
-            }
+            assert_eq!(original_text, decoded.trim());
         }
     }
 }
