@@ -37,7 +37,7 @@ criterion = { version = "0.3.6", default_features = false }
 tracing = { path = "../tracing", version = "0.1.35" }
 time = { version = "0.3.2", default-features = false, features = ["formatting", "parsing"] }
 tempfile = "3.3.0"
-lz4 = "1.24"
+snap = "1.1.0"
 
 [features]
 default = []

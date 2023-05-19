@@ -26,11 +26,13 @@
 //! let file_appender = RollingFileAppender::new(Rotation::HOURLY, "/some/directory", "prefix.log");
 //! # }
 //! ```
-use crate::sync::{RwLock, RwLockReadGuard};
-use crate::ZippingFn;
+use crate::{
+    sync::{Mutex, MutexGuard},
+    BuilderFn,
+};
 use std::{
     fmt::{self, Debug},
-    fs::{self, File, OpenOptions},
+    fs::{self, OpenOptions},
     io::{self, Write},
     path::{Path, PathBuf},
     sync::atomic::{AtomicUsize, Ordering},
@@ -86,7 +88,7 @@ pub use builder::{Builder, InitError};
 /// [`MakeWriter`]: tracing_subscriber::fmt::writer::MakeWriter
 pub struct RollingFileAppender {
     state: Inner,
-    writer: RwLock<File>,
+    writer: Mutex<Box<dyn Write + Send>>,
     #[cfg(test)]
     now: Box<dyn Fn() -> OffsetDateTime + Send + Sync>,
 }
@@ -97,10 +99,14 @@ pub struct RollingFileAppender {
 ///
 /// [writer]: std::io::Write
 /// [`MakeWriter`]: tracing_subscriber::fmt::writer::MakeWriter
-#[derive(Debug)]
-pub struct RollingWriter<'a>(RwLockReadGuard<'a, File>);
+pub struct RollingWriter<'a>(MutexGuard<'a, Box<dyn Write + Send>>);
 
-#[derive(Debug)]
+impl<'a> fmt::Debug for RollingWriter<'a> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RollingWriter").finish()
+    }
+}
+
 struct Inner {
     log_directory: PathBuf,
     log_filename_prefix: Option<String>,
@@ -109,7 +115,20 @@ struct Inner {
     rotation: Rotation,
     next_date: AtomicUsize,
     max_files: Option<usize>,
-    zipping: Option<(String, ZippingFn)>,
+    writer_builder: BuilderFn,
+}
+
+impl fmt::Debug for Inner {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Inner")
+            .field("log_directory", &self.log_directory)
+            .field("log_filename_prefix", &self.log_filename_prefix)
+            .field("log_filename_suffix", &self.log_filename_suffix)
+            .field("rotation", &self.rotation)
+            .field("next_date", &self.next_date)
+            .field("max_files", &self.max_files)
+            .finish()
+    }
 }
 
 // === impl RollingFileAppender ===
@@ -194,7 +213,7 @@ impl RollingFileAppender {
             ref prefix,
             ref suffix,
             ref max_files,
-            ref zipping,
+            ref writer_builder,
         } = builder;
         let directory = directory.as_ref().to_path_buf();
         let now = OffsetDateTime::now_utc();
@@ -205,7 +224,7 @@ impl RollingFileAppender {
             prefix.clone(),
             suffix.clone(),
             *max_files,
-            zipping.clone(),
+            writer_builder.clone(),
         )?;
         Ok(Self {
             state,
@@ -232,7 +251,7 @@ impl io::Write for RollingFileAppender {
         if let Some(current_time) = self.state.should_rollover(now) {
             let _did_cas = self.state.advance_date(now, current_time);
             debug_assert!(_did_cas, "if we have &mut access to the appender, no other thread can have advanced the timestamp...");
-            self.state.refresh_writer(now, writer);
+            self.state.refresh_writer(now, &mut *writer);
         }
         writer.write(buf)
     }
@@ -252,10 +271,10 @@ impl<'a> tracing_subscriber::fmt::writer::MakeWriter<'a> for RollingFileAppender
             // Did we get the right to lock the file? If not, another thread
             // did it and we can just make a writer.
             if self.state.advance_date(now, current_time) {
-                self.state.refresh_writer(now, &mut self.writer.write());
+                self.state.refresh_writer(now, &mut self.writer.lock());
             }
         }
-        RollingWriter(self.writer.read())
+        RollingWriter(self.writer.lock())
     }
 }
 
@@ -265,7 +284,6 @@ impl fmt::Debug for RollingFileAppender {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RollingFileAppender")
             .field("state", &self.state)
-            .field("writer", &self.writer)
             .finish()
     }
 }
@@ -513,11 +531,11 @@ impl Rotation {
 
 impl io::Write for RollingWriter<'_> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        (&*self.0).write(buf)
+        self.0.write(buf)
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        (&*self.0).flush()
+        self.0.flush()
     }
 }
 
@@ -531,11 +549,18 @@ impl Inner {
         log_filename_prefix: Option<String>,
         log_filename_suffix: Option<String>,
         max_files: Option<usize>,
-        zip: Option<(String, ZippingFn)>,
-    ) -> Result<(Self, RwLock<File>), builder::InitError> {
+        writer_builder: Option<BuilderFn>,
+    ) -> Result<(Self, Mutex<Box<dyn Write + Send>>), builder::InitError> {
         let log_directory = directory.as_ref().to_path_buf();
         let date_format = rotation.date_format();
         let next_date = rotation.next_date(&now);
+
+        let default_builder =
+            std::sync::Arc::new(|writer: Box<dyn Write + Send>| -> Box<dyn Write + Send> {
+                writer
+            });
+
+        let writer_builder = writer_builder.unwrap_or(default_builder);
 
         let inner = Inner {
             log_directory,
@@ -549,10 +574,14 @@ impl Inner {
             ),
             rotation,
             max_files,
-            zipping: zip,
+            writer_builder: writer_builder.clone(),
         };
         let filename = inner.join_date(&now);
-        let writer = RwLock::new(create_writer(inner.log_directory.as_ref(), &filename)?);
+
+        let writer_box = create_writer(inner.log_directory.as_ref(), &filename, writer_builder)?;
+
+        let writer = Mutex::new(writer_box);
+
         Ok((inner, writer))
     }
 
@@ -576,61 +605,31 @@ impl Inner {
         }
     }
 
-    // creating a custom error type should have been better for this function, but since across the library I haven't seen custom errors, but usage of `io::Result`,
-    // I decided to follow the convention
-    fn list_log_files(
-        &self,
-        include_zip_files: bool,
-    ) -> io::Result<Vec<(fs::DirEntry, std::time::SystemTime)>> {
-        let files = fs::read_dir(&self.log_directory)?
-            .filter_map(|entry| {
-                let entry = entry
-                    .map_err(|e| {
-                        io::Error::new(
-                            io::ErrorKind::Other,
-                            format!("Error reading an entry from the log directory: {}", e),
-                        )
-                    })
-                    .ok()?;
+    fn prune_old_logs(&self, max_files: usize) {
+        let files = fs::read_dir(&self.log_directory).map(|dir| {
+            dir.filter_map(|entry| {
+                let entry = entry.ok()?;
+                let metadata = entry.metadata().ok()?;
 
-                let metadata = entry
-                    .metadata()
-                    .map_err(|e| {
-                        io::Error::new(
-                            io::ErrorKind::Other,
-                            format!("Error reading metadata of an entry: {}", e),
-                        )
-                    })
-                    .ok()?;
-
+                // the appender only creates files, not directories or symlinks,
+                // so we should never delete a dir or symlink.
                 if !metadata.is_file() {
                     return None;
                 }
 
                 let filename = entry.file_name();
-                let filename = filename
-                    .to_str()
-                    .ok_or_else(|| {
-                        io::Error::new(io::ErrorKind::Other, "Filename is not a UTF-8 string")
-                    })
-                    .ok()?;
-
+                // if the filename is not a UTF-8 string, skip it.
+                let filename = filename.to_str()?;
                 if let Some(prefix) = &self.log_filename_prefix {
                     if !filename.starts_with(prefix) {
                         return None;
                     }
                 }
 
-                match (&self.zipping, &self.log_filename_suffix) {
-                    (Some((extension, _)), _)
-                        if !include_zip_files && filename.ends_with(extension) =>
-                    {
+                if let Some(suffix) = &self.log_filename_suffix {
+                    if !filename.ends_with(suffix) {
                         return None;
                     }
-                    (None, Some(suffix)) if !filename.ends_with(suffix) => {
-                        return None;
-                    }
-                    _ => (),
                 }
 
                 if self.log_filename_prefix.is_none()
@@ -643,21 +642,16 @@ impl Inner {
                 let created = metadata.created().ok()?;
                 Some((entry, created))
             })
-            .collect();
+            .collect::<Vec<_>>()
+        });
 
-        Ok(files)
-    }
-
-    fn prune_old_logs(&self, max_files: usize) {
-        // Read the log directory to find the log files
-        let mut files = match self.list_log_files(true) {
+        let mut files = match files {
             Ok(files) => files,
             Err(error) => {
                 eprintln!("Error reading the log directory/files: {}", error);
                 return;
             }
         };
-
         if files.len() < max_files {
             return;
         }
@@ -677,61 +671,19 @@ impl Inner {
         }
     }
 
-    // This function is called after each refresh (rotating to a new file). Thus, it only zips the latest log file
-    fn zip_log(&self) -> io::Result<()> {
-        // Read the log directory to find the log files
-        let mut files = self
-            .list_log_files(false)
-            .map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
-
-        // sort the files by their creation timestamps.
-        files.sort_by_key(|(_, created_at)| *created_at);
-
-        let (file, _) = files.last().unwrap();
-        // Get input file path
-        let input_file_path = file.path();
-
-        let input_filename = input_file_path
-            .file_name()
-            .expect("Filename should be present")
-            .to_str()
-            .expect("Filename should be valid UTF-8");
-
-        let (extension, zipping_fn) = self.zipping.as_ref().unwrap();
-
-        let output_filename = format!("{}.{}", input_filename, extension);
-
-        let output_file_path = input_file_path.with_file_name(output_filename);
-        let mut output_file = File::create(output_file_path)?;
-
-        let mut input_file = File::open(&input_file_path)?;
-        zipping_fn.execute(&mut input_file, &mut output_file)?;
-
-        fs::remove_file(input_file_path)?;
-
-        Ok(())
-    }
-
-    fn refresh_writer(&self, now: OffsetDateTime, file: &mut File) {
+    fn refresh_writer(&self, now: OffsetDateTime, writer: &mut Box<dyn Write + Send>) {
         let filename = self.join_date(&now);
 
         if let Some(max_files) = self.max_files {
             self.prune_old_logs(max_files);
         }
 
-        // don't know how long this might take, should we start this in a thread?
-        if self.zipping.is_some() {
-            if let Err(err) = self.zip_log() {
-                eprintln!("Couldn't successfully zip the latest log file: {}", err);
-            }
-        }
-
-        match create_writer(&self.log_directory, &filename) {
+        match create_writer(&self.log_directory, &filename, self.writer_builder.clone()) {
             Ok(new_file) => {
-                if let Err(err) = file.flush() {
+                if let Err(err) = writer.flush() {
                     eprintln!("Couldn't flush previous writer: {}", err);
                 }
-                *file = new_file;
+                *writer = new_file;
             }
             Err(err) => eprintln!("Couldn't create writer for logs: {}", err),
         }
@@ -771,7 +723,11 @@ impl Inner {
     }
 }
 
-fn create_writer(directory: &Path, filename: &str) -> Result<File, InitError> {
+fn create_writer(
+    directory: &Path,
+    filename: &str,
+    writer_builder: BuilderFn,
+) -> Result<Box<dyn Write + Send>, InitError> {
     let path = directory.join(filename);
     let mut open_options = OpenOptions::new();
     open_options.append(true).create(true);
@@ -782,11 +738,16 @@ fn create_writer(directory: &Path, filename: &str) -> Result<File, InitError> {
             fs::create_dir_all(parent).map_err(InitError::ctx("failed to create log directory"))?;
             return open_options
                 .open(path)
+                .map(|f| Box::new(f) as Box<dyn Write + Send>)
                 .map_err(InitError::ctx("failed to create initial log file"));
         }
     }
 
-    new_file.map_err(InitError::ctx("failed to create initial log file"))
+    let writer = new_file.map(|f| Box::new(f) as Box<dyn Write + Send>);
+
+    writer
+        .map(|w| writer_builder(w))
+        .map_err(InitError::ctx("failed to create initial log file"))
 }
 
 #[cfg(test)]
@@ -1196,150 +1157,48 @@ mod test {
     }
 
     #[test]
-    fn test_zipping() {
+    fn test_log_with_snappy_encoding() {
+        use snap::{read::FrameDecoder, write::FrameEncoder};
         use std::io::Read;
         use std::sync::{Arc, Mutex};
         use tracing_subscriber::prelude::*;
 
+        // Format and current time for the logger
         let format = format_description::parse(
             "[year]-[month]-[day] [hour]:[minute]:[second] [offset_hour \
-     sign:mandatory]:[offset_minute]:[offset_second]",
+         sign:mandatory]:[offset_minute]:[offset_second]",
         )
         .unwrap();
+        let now = OffsetDateTime::parse("2020-02-01 10:01:00 +00:00:00", &format).unwrap();
 
-        let now = OffsetDateTime::parse("2023-05-01 10:01:00 +00:00:00", &format).unwrap();
-        let directory = tempfile::tempdir().expect("failed to create tempdir");
+        // Create a temporary directory
+        let directory = tempfile::tempdir().expect("Failed to create temporary directory");
 
-        // write a compression function
-        fn lz4_compress(input: &mut dyn Read, output: &mut dyn Write) -> std::io::Result<()> {
-            let mut encoder = lz4::EncoderBuilder::new().build(output)?;
-            io::copy(input, &mut encoder)?;
-            let (_output, result) = encoder.finish();
-            result
-        }
-        let compress_fn = ZippingFn(Arc::new(Box::new(lz4_compress)));
+        let builder_fn: BuilderFn = Arc::new(move |writer| -> Box<dyn Write + Send> {
+            Box::new(FrameEncoder::new(writer))
+        });
 
+        // Configure the logger with a Snappy encoder
         let (state, writer) = Inner::new(
             now,
             Rotation::HOURLY,
             directory.path(),
-            Some("test_zip_log".to_string()),
-            None,
-            None,
-            Some(("lz4".to_string(), compress_fn)),
-        )
-        .unwrap();
-
-        let clock = Arc::new(Mutex::new(now));
-        let now = {
-            let clock = clock.clone();
-            Box::new(move || *clock.lock().unwrap())
-        };
-        let appender = RollingFileAppender { state, writer, now };
-        let default = tracing_subscriber::fmt()
-            .without_time()
-            .with_level(false)
-            .with_target(false)
-            .with_max_level(tracing_subscriber::filter::LevelFilter::TRACE)
-            .with_writer(appender)
-            .finish()
-            .set_default();
-
-        tracing::info!("file 1");
-
-        // advance time by one hour
-        (*clock.lock().unwrap()) += Duration::hours(1);
-
-        // depending on the filesystem, the creation timestamp's resolution may
-        // be as coarse as one second, so we need to wait a bit here to ensure
-        // that the next file actually is newer than the old one.
-        std::thread::sleep(std::time::Duration::from_secs(1));
-
-        tracing::info!("file 2");
-
-        drop(default);
-
-        let dir_contents = fs::read_dir(directory.path()).expect("Failed to read directory");
-        println!("dir={:?}", dir_contents);
-
-        let mut found_zip = false;
-        let mut found_original = false;
-
-        for entry in dir_contents {
-            let entry = entry.expect("Expected dir entry");
-            let path = entry.path();
-
-            println!("entry={:?}", entry);
-
-            if path.extension().unwrap() == "lz4" {
-                found_zip = true;
-                let zip_file = fs::File::open(&path).expect("Failed to open zip file");
-                let mut decoder =
-                    lz4::Decoder::new(zip_file).expect("Failed to create lz4 decoder");
-                let mut contents = String::new();
-                decoder
-                    .read_to_string(&mut contents)
-                    .expect("Failed to read the file content");
-
-                assert_eq!(
-                    "file 1\n", contents,
-                    "Unexpected content in the lz4 compressed log file"
-                );
-            } else {
-                let filename = path.file_name().unwrap().to_str().unwrap();
-                if filename.starts_with("test_zip_log") && filename.ends_with("2023-05-01-10") {
-                    found_original = true;
-                }
-            }
-        }
-
-        assert!(
-            found_zip,
-            "Expected to find a zip file in the log directory"
-        );
-        assert!(!found_original, "Expected the first log file to be removed");
-    }
-
-    #[test]
-    fn test_integration_prune_and_zip() {
-        use std::io::Read;
-        use std::sync::{Arc, Mutex};
-        use tracing_subscriber::prelude::*;
-
-        let format = format_description::parse(
-            "[year]-[month]-[day] [hour]:[minute]:[second] [offset_hour \
-     sign:mandatory]:[offset_minute]:[offset_second]",
-        )
-        .unwrap();
-
-        // write a compression function
-        fn lz4_compress(input: &mut dyn Read, output: &mut dyn Write) -> std::io::Result<()> {
-            let mut encoder = lz4::EncoderBuilder::new().build(output)?;
-            io::copy(input, &mut encoder)?;
-            let (_output, result) = encoder.finish();
-            result
-        }
-        let compress_fn = ZippingFn(Arc::new(Box::new(lz4_compress)));
-
-        let now = OffsetDateTime::parse("2023-05-01 10:01:00 +00:00:00", &format).unwrap();
-        let directory = tempfile::tempdir().expect("failed to create tempdir");
-        let (state, writer) = Inner::new(
-            now,
-            Rotation::HOURLY,
-            directory.path(),
-            Some("test_zip_log".to_string()),
+            Some("test_log_with_snappy_encoding".to_string()),
             None,
             Some(2),
-            Some(("lz4".to_string(), compress_fn)),
+            Some(builder_fn),
         )
         .unwrap();
 
+        // Setup the clock
         let clock = Arc::new(Mutex::new(now));
         let now = {
             let clock = clock.clone();
             Box::new(move || *clock.lock().unwrap())
         };
         let appender = RollingFileAppender { state, writer, now };
+
+        // Initialize the logger
         let default = tracing_subscriber::fmt()
             .without_time()
             .with_level(false)
@@ -1349,47 +1208,50 @@ mod test {
             .finish()
             .set_default();
 
-        for i in 0..5 {
-            tracing::info!("file {}", i);
-
-            // advance time by one hour
-            (*clock.lock().unwrap()) += Duration::hours(1);
-
-            // depending on the filesystem, the creation timestamp's resolution may
-            // be as coarse as one second, so we need to wait a bit here to ensure
-            // that the next file actually is newer than the old one.
-            std::thread::sleep(std::time::Duration::from_secs(1));
-        }
+        // Log some messages
+        tracing::info!("This is a test log message 1.");
+        (*clock.lock().unwrap()) += Duration::hours(1);
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        tracing::info!("This is a test log message 2.");
 
         drop(default);
 
-        let dir_contents = fs::read_dir(directory.path()).expect("Failed to read directory");
-        println!("dir={:?}", dir_contents);
+        // Iterate over the directory and assert on each file's contents
+        let dir_entries = fs::read_dir(directory.path()).expect("Failed to read directory");
 
-        let mut zip_count = 0;
-        let mut non_zip_count = 0;
-
-        for entry in dir_contents {
-            let entry = entry.expect("Expected dir entry");
-            let path = entry.path();
-
-            println!("entry={:?}", entry);
-
-            if path.extension().unwrap() == "lz4" {
-                zip_count += 1;
+        for entry in dir_entries {
+            let entry = entry.expect("Failed to read entry");
+            let file_path = entry.path();
+            let original_text = if file_path.to_str().unwrap().contains("2020-02-01-10") {
+                "This is a test log message 1."
             } else {
-                non_zip_count += 1;
+                "This is a test log message 2."
+            };
+
+            // Open the file and read it into a buffer
+            let mut file = fs::File::open(&file_path).expect("Failed to open file");
+            let mut buffer = Vec::new();
+            file.read_to_end(&mut buffer).expect("Failed to read file");
+
+            // Decode the Snappy encoded contents
+            let mut decoder = FrameDecoder::new(&buffer[..]);
+            let mut decoded = String::new();
+            decoder
+                .read_to_string(&mut decoded)
+                .expect("Failed to decode Snappy content");
+
+            // Assert on the contents
+            if file_path
+                .extension()
+                .expect("No extension")
+                .to_str()
+                .expect("Not UTF8")
+                == "1"
+            {
+                assert_eq!(original_text, decoded.trim());
+            } else {
+                assert_eq!(original_text, decoded.trim());
             }
         }
-
-        assert_eq!(
-            zip_count, 1,
-            "Expected to find exactly 1 zip file in the log directory"
-        );
-
-        assert_eq!(
-            non_zip_count, 1,
-            "Expected to find exactly 1 non-zip file in the log directory"
-        );
     }
 }

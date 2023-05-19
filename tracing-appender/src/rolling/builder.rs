@@ -1,19 +1,39 @@
-use crate::ZippingFn;
-
 use super::{RollingFileAppender, Rotation};
-use std::{io, path::Path};
+use crate::BuilderFn;
+
+use std::{
+    io::{self, Write},
+    path::Path,
+};
 use thiserror::Error;
 
 /// A [builder] for configuring [`RollingFileAppender`]s.
 ///
 /// [builder]: https://rust-unofficial.github.io/patterns/patterns/creational/builder.html
-#[derive(Debug)]
 pub struct Builder {
     pub(super) rotation: Rotation,
     pub(super) prefix: Option<String>,
     pub(super) suffix: Option<String>,
     pub(super) max_files: Option<usize>,
-    pub(super) zipping: Option<(String, ZippingFn)>,
+    pub(super) writer_builder: Option<BuilderFn>,
+}
+
+impl std::fmt::Debug for Builder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Builder")
+            .field("rotation", &self.rotation)
+            .field("prefix", &self.prefix)
+            .field("suffix", &self.suffix)
+            .field("max_files", &self.max_files)
+            .field(
+                "custom writer builder",
+                &self
+                    .writer_builder
+                    .as_ref()
+                    .map(|_| "custom writer function present"),
+            )
+            .finish()
+    }
 }
 
 /// Errors returned by [`Builder::build`].
@@ -57,7 +77,7 @@ impl Builder {
             prefix: None,
             suffix: None,
             max_files: None,
-            zipping: None,
+            writer_builder: None,
         }
     }
 
@@ -237,44 +257,18 @@ impl Builder {
         }
     }
 
-    /// zips the finalized log files. Zipped logs are not excluded from the rotation!
+    /// Wraps the current file writer with the provided writer
     ///
-    /// When a new log file is created, if there are `n` or more
-    /// existing log files in the directory, the oldest will be deleted.
-    /// If no value is supplied, the `RollingAppender` will not remove any files.
-    ///
-    /// Files are considered candidates for zipping based on the following
-    /// criteria:
-    ///
-    /// * The file must not be a directory or symbolic link.
-    /// * If the appender is configured with a [`filename_prefix`], the file
-    ///   name must start with that prefix.
-    /// * If the appender is configured with a [`filename_suffix`], the file
-    ///   name must end with that suffix.
-    /// * If the appender has neither a filename prefix nor a suffix, then the
-    ///   file name must parse as a valid date based on the appender's date
-    ///   format.
-    ///
-    /// [`filename_prefix`]: Self::filename_prefix
-    /// [`filename_suffix`]: Self::filename_suffix
+    /// With this approach, compression can be enabled if a compression writer builder is provided
     ///
     /// # Examples
     ///
     /// ```
     /// use tracing_appender::rolling::{RollingFileAppender, ZippingFn};
-    /// use lz4::EncoderBuilder;
-    /// use std::io;
-    ///
-    /// # fn docs() {
-    /// let lz4_fn = ZippingFn(Box::new(|input: &mut dyn io::Read, output: &mut dyn io::Write| {
-    ///     let mut encoder = EncoderBuilder::new().level(4).build(output)?;
-    ///     io::copy(input, &mut encoder)?;
-    ///     let (_output, result) = encoder.finish();
-    ///     result
-    /// }));
+    /// use snap::write::FrameEncoder;
     ///
     /// let appender = RollingFileAppender::builder()
-    ///     .zipping("lz4", lz4_fn) // enable zipping
+    ///     .writer_builder(FrameEncoder::new) // snappy encoder will wrap the default file writer
     ///     // ...
     ///     .build("/var/log")
     ///     .expect("failed to initialize rolling file appender");
@@ -282,9 +276,17 @@ impl Builder {
     /// # }
     /// ```
     #[must_use]
-    pub fn zipping(self, extension: String, zipping_function: ZippingFn) -> Self {
+    pub fn writer_builder<F, O>(self, builder: F) -> Self
+    where
+        F: (Fn(Box<dyn Write + Send>) -> O) + Send + Sync + 'static,
+        O: Write + Send + 'static,
+    {
+        let builder_fn: BuilderFn = std::sync::Arc::new(move |writer| -> Box<dyn Write + Send> {
+            Box::new(builder(writer))
+        });
+
         Self {
-            zipping: Some((extension, zipping_function)),
+            writer_builder: Some(builder_fn),
             ..self
         }
     }
